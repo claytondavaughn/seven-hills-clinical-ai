@@ -90,6 +90,14 @@ class Store:
             args['ExclusiveStartKey']=page['LastEvaluatedKey']
     def dispatch(self,body,review):
         action=body.get('action')
+        if action=='command_center':
+            profiles=list(self.query('PROFILE#'))
+            rows=[]
+            for p in profiles:
+                visits=[v for v in self.query('VISIT#'+p['patient_id']+'#') if v['status']=='final']
+                visits.sort(key=history_order)
+                rows.append({'patient_id':p['patient_id'],'name':p['profile']['name'],'diagnosis':p['profile']['diagnosis'],'status':p['status'],'last_visit':visits[-1]['assessment_date'] if visits else None,'benefit_period':visits[-1]['benefit_period'] if visits else None,'visit_count':len(visits),'last_idg':next((v['assessment_date'] for v in reversed(visits) if v['visit_type']=='IDG'),None),'last_f2f':next((v['assessment_date'] for v in reversed(visits) if v['visit_type']=='Face-to-face'),None),'trajectory':[{'date':v['assessment_date'],'metrics':v['metrics']} for v in visits if v['metrics']][-12:]})
+            return {'patients':rows,'regulatory_metrics_enabled':False}
         if action=='list_patients':
             return {'patients':list(self.query('PROFILE#'))}
         pid=clean_id(body.get('patient_id'))
@@ -105,6 +113,12 @@ class Store:
         if action=='set_patient_status':
             status=body.get('status')
             if status not in ('active','inactive','discharged','deceased'): raise Invalid('Invalid patient status')
+            if profile['status'] in ('discharged','deceased') and status!=profile['status']: raise Conflict('Closed patient status requires a future audited reopening workflow')
+            if status in ('discharged','deceased'):
+                reason=body.get('reason')
+                if not isinstance(reason,str) or not reason.strip() or len(reason)>1000: raise Invalid('Closure reason required')
+                if status=='discharged' and not any(v['status']=='final' and v['visit_type']=='Discharge' for v in self.query('VISIT#'+pid+'#')): raise Conflict('Finalize discharge documentation first')
+                self.put('STATUS#'+pid+'#'+clean_id(body.get('event_id')),{'patient_id':pid,'from_status':profile['status'],'to_status':status,'reason':reason,'created_at':now(),'created_by':self.sub})
             row=self.table.update_item(Key=self.key(profile_key),UpdateExpression='SET #s=:s, updated_at=:at, updated_by=:by',
                 ConditionExpression='attribute_exists(PK)',ExpressionAttributeNames={'#s':'status'},
                 ExpressionAttributeValues={':s':status,':at':now(),':by':self.sub},ReturnValues='ALL_NEW')
@@ -122,7 +136,8 @@ class Store:
             rows=list(self.query(prefix))
             final=sorted((x for x in rows if x['status']=='final'),key=history_order)
             baseline=next((x for x in final if x['visit_type']=='Admission'),None)
-            return {'patient':profile,'visits':rows,'baseline':baseline,'addenda':list(self.query('ADDENDUM#'+pid+'#')),'benefit_periods':sorted(set(x['benefit_period'] for x in final))}
+            return {'patient':profile,'visits':rows,'baseline':baseline,'addenda':list(self.query('ADDENDUM#'+pid+'#')),'benefit_periods':sorted(set(x['benefit_period'] for x in final)),'status_history':list(self.query('STATUS#'+pid+'#'))}
+        if profile['status'] in ('discharged','deceased'): raise Conflict('Patient is closed; only chart review and addenda are available')
         if action not in ('save_draft','review_visit','finalize_visit'): raise Invalid('Unknown action')
         vid=clean_id(body.get('visit_id'))
         sk=prefix+vid
