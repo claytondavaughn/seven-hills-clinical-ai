@@ -47,7 +47,7 @@ def history_order(row):
     return (row['assessment_date'],row.get('finalized_at',row['created_at']),row['visit_id'])
 
 def history_fingerprint(rows):
-    return hashlib.sha256(json.dumps(sorted((x['visit_id'],x['version']) for x in rows)).encode()).hexdigest()
+    return hashlib.sha256(json.dumps(sorted((x['visit_id'],int(x['version'])) for x in rows)).encode()).hexdigest()
 
 def compare(current, previous):
     result={}
@@ -114,15 +114,22 @@ class Store:
             status=body.get('status')
             if status not in ('active','inactive','discharged','deceased'): raise Invalid('Invalid patient status')
             if profile['status'] in ('discharged','deceased') and status!=profile['status']: raise Conflict('Closed patient status requires a future audited reopening workflow')
+            if status==profile['status']: return {'patient':profile}
             if status in ('discharged','deceased'):
                 reason=body.get('reason')
                 if not isinstance(reason,str) or not reason.strip() or len(reason)>1000: raise Invalid('Closure reason required')
                 if status=='discharged' and not any(v['status']=='final' and v['visit_type']=='Discharge' for v in self.query('VISIT#'+pid+'#')): raise Conflict('Finalize discharge documentation first')
-                self.put('STATUS#'+pid+'#'+clean_id(body.get('event_id')),{'patient_id':pid,'from_status':profile['status'],'to_status':status,'reason':reason,'created_at':now(),'created_by':self.sub})
-            row=self.table.update_item(Key=self.key(profile_key),UpdateExpression='SET #s=:s, updated_at=:at, updated_by=:by',
-                ConditionExpression='attribute_exists(PK)',ExpressionAttributeNames={'#s':'status'},
-                ExpressionAttributeValues={':s':status,':at':now(),':by':self.sub},ReturnValues='ALL_NEW')
-            return {'patient':row['Attributes']}
+                clean_id(body.get('event_id'))
+            # Atomic profile replacement preserves status audit together with the transition.
+            events=profile.get('status_history',[])
+            if len(events)>=100: raise Conflict('Status history limit reached')
+            entry={'from_status':profile['status'],'to_status':status,'reason':body.get('reason','') if status in ('discharged','deceased') else '', 'created_at':now(),'created_by':self.sub}
+            row={**profile,'status':status,'status_history':events+[entry],'updated_at':now(),'updated_by':self.sub}
+            try: self.table.put_item(Item=row,ConditionExpression='#s = :old AND updated_at = :at',ExpressionAttributeNames={'#s':'status'},ExpressionAttributeValues={':old':profile['status'],':at':profile['updated_at']})
+            except ClientError as e:
+                if e.response['Error']['Code']=='ConditionalCheckFailedException': raise Conflict('Patient status changed')
+                raise
+            return {'patient':row}
         prefix='VISIT#'+pid+'#'
         if action=='add_addendum':
             target=clean_id(body.get('visit_id'))
@@ -136,7 +143,7 @@ class Store:
             rows=list(self.query(prefix))
             final=sorted((x for x in rows if x['status']=='final'),key=history_order)
             baseline=next((x for x in final if x['visit_type']=='Admission'),None)
-            return {'patient':profile,'visits':rows,'baseline':baseline,'addenda':list(self.query('ADDENDUM#'+pid+'#')),'benefit_periods':sorted(set(x['benefit_period'] for x in final)),'status_history':list(self.query('STATUS#'+pid+'#'))}
+            return {'patient':profile,'visits':rows,'baseline':baseline,'addenda':list(self.query('ADDENDUM#'+pid+'#')),'benefit_periods':sorted(set(x['benefit_period'] for x in final)),'status_history':profile.get('status_history',[])+list(self.query('STATUS#'+pid+'#'))}
         if profile['status'] in ('discharged','deceased'): raise Conflict('Patient is closed; only chart review and addenda are available')
         if action not in ('save_draft','review_visit','finalize_visit'): raise Invalid('Unknown action')
         vid=clean_id(body.get('visit_id'))
@@ -195,6 +202,7 @@ class Store:
             if visit_type in ('IDG','CTI evidence summary','Face-to-face','Recertification'):
                 patient['dated_prior_findings']=[{'date':x['assessment_date'],'type':x['visit_type'],'benefit_period':x['benefit_period'],'metrics':safe_json(x['metrics']),'assessment':x['assessment'][:1500]} for x in history[-8:]]
             output=review(safe_json(patient))
-            if output.get('status')!='draft_ready': return {'review':output}
+            if output.get('status')!='draft_ready':
+                return {'visit':self.put(sk,row,version if version else None),'review':output}
             row['review']=bounded(output,60000)
         return {'visit':self.put(sk,row,version if version else None)}
