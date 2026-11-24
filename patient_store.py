@@ -1,5 +1,5 @@
 """Synthetic-only, per-user patient persistence. No scans or client-owned keys."""
-import os, json, uuid, re
+import os, json, re
 from datetime import datetime, timezone, date
 from decimal import Decimal
 import boto3
@@ -22,9 +22,10 @@ def safe_json(value):
     return json.loads(json.dumps(value, default=lambda x: float(x) if isinstance(x,Decimal) else str(x)))
 
 def bounded(value, limit=30000):
-    if not isinstance(value,dict) or len(json.dumps(value))>limit:
+    if not isinstance(value,dict) or len(json.dumps(value,default=str))>limit:
         raise Invalid('Invalid record')
-    return json.loads(json.dumps(value,allow_nan=False),parse_float=Decimal)
+    try: return json.loads(json.dumps(value,allow_nan=False),parse_float=Decimal)
+    except (TypeError,ValueError): raise Invalid('Invalid JSON record')
 
 def metrics(value):
     if not isinstance(value,dict): raise Invalid('Invalid metrics')
@@ -95,6 +96,13 @@ class Store:
             p={k:p[k] for k in ('name','diagnosis','sex','age','comorbidities')}
             return {'patient':self.put(profile_key,{'patient_id':pid,'profile':p,'created_at':now(),'created_by':self.sub,'status':'active'})}
         profile=self.get(profile_key)
+        if action=='set_patient_status':
+            status=body.get('status')
+            if status not in ('active','inactive'): raise Invalid('Invalid patient status')
+            row=self.table.update_item(Key=self.key(profile_key),UpdateExpression='SET #s=:s, updated_at=:at, updated_by=:by',
+                ConditionExpression='attribute_exists(PK)',ExpressionAttributeNames={'#s':'status'},
+                ExpressionAttributeValues={':s':status,':at':now(),':by':self.sub},ReturnValues='ALL_NEW')
+            return {'patient':row['Attributes']}
         prefix='VISIT#'+pid+'#'
         if action=='get_chart':
             rows=list(self.query(prefix))
@@ -145,6 +153,8 @@ class Store:
             patient.pop('name',None)
             if 'pps' in current: patient['current_pps']=int(current['pps'])
             if prior and 'pps' in prior['metrics']: patient['previous_pps']=int(prior['metrics']['pps'])
+            if row['comparison']: patient['verified_prior_comparison']={'assessment_date':prior['assessment_date'],'metrics':safe_json(row['comparison'])}
+            if row['baseline_comparison']: patient['verified_admission_comparison']={'assessment_date':baseline['assessment_date'],'metrics':safe_json(row['baseline_comparison'])}
             output=review(safe_json(patient))
             if output.get('status')!='draft_ready': return {'review':output}
             row['review']=bounded(output,60000)
