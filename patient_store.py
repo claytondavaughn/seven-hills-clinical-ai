@@ -101,7 +101,7 @@ class Store:
             final=sorted((x for x in rows if x['status']=='final'),key=lambda x:(x['assessment_date'],x['created_at']))
             baseline=next((x for x in final if x['visit_type']=='Admission'),None)
             return {'patient':profile,'visits':rows,'baseline':baseline}
-        if action not in ('save_draft','finalize_visit'): raise Invalid('Unknown action')
+        if action not in ('save_draft','review_visit','finalize_visit'): raise Invalid('Unknown action')
         vid=clean_id(body.get('visit_id'))
         sk=prefix+vid
         version=body.get('version',0)
@@ -119,8 +119,20 @@ class Store:
         bp=data.get('benefit_period')
         if type(bp) is not int or not 1<=bp<=100: raise Invalid('Invalid benefit period')
         current=metrics(data.get('metrics',{}))
+        if 'weight_lb' in current:
+            try: weight_date=date.fromisoformat(data.get('form',{}).get('clinical',{}).get('currentDate','')).isoformat()
+            except (ValueError,TypeError,AttributeError): raise Invalid('Current weight requires a measurement date')
+            if weight_date!=day: raise Invalid('Current structured weight must be measured on assessment date')
         row={'patient_id':pid,'visit_id':vid,'version':version+1,'status':'draft','assessment_date':day,'visit_type':visit_type,'benefit_period':bp,'assessment':findings,'metrics':current,'form':bounded(data.get('form',{})),'created_at':previous['created_at'] if previous else now(),'created_by':self.sub}
         if action=='finalize_visit':
+            if not previous or previous.get('review',{}).get('status')!='draft_ready':
+                raise Conflict('Review this draft before finalizing')
+            for k in ('assessment_date','visit_type','benefit_period','assessment','metrics','form'):
+                if row[k]!=previous[k]: raise Conflict('Findings changed; review again')
+            row.update(status='final',review=previous['review'],finalized_at=now(),finalized_by=self.sub,
+                       comparison=previous['comparison'],baseline_comparison=previous['baseline_comparison'],
+                       prior_visit_id=previous['prior_visit_id'],baseline_visit_id=previous['baseline_visit_id'])
+        if action=='review_visit':
             if not findings.strip(): raise Invalid('Assessment findings required')
             history=sorted((x for x in self.query(prefix) if x['status']=='final' and x['assessment_date']<=day),key=lambda x:(x['assessment_date'],x['created_at']))
             prior=history[-1] if history else None
@@ -135,5 +147,5 @@ class Store:
             if prior and 'pps' in prior['metrics']: patient['previous_pps']=int(prior['metrics']['pps'])
             output=review(safe_json(patient))
             if output.get('status')!='draft_ready': return {'review':output}
-            row.update(status='final',review=output,finalized_at=now(),finalized_by=self.sub)
+            row['review']=bounded(output,60000)
         return {'visit':self.put(sk,row,version if version else None)}
