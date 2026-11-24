@@ -1,5 +1,5 @@
 """Synthetic-only, per-user patient persistence. No scans or client-owned keys."""
-import os, json, re
+import os, json, re, hashlib
 from datetime import datetime, timezone, date
 from decimal import Decimal
 import boto3
@@ -33,7 +33,7 @@ def metrics(value):
     for k,lo,hi in [('pps',0,100),('weight_lb',0.01,1500),('mac_cm',0.01,150),('adl_dependence',0,6)]:
         if k not in value or value[k] in ('',None): continue
         v=value[k]
-        if isinstance(v,bool) or not isinstance(v,(int,float,Decimal)) or not lo<=v<=hi: raise Invalid('Invalid '+k)
+        if isinstance(v,bool) or not isinstance(v,(int,float,Decimal)) or not Decimal(str(v)).is_finite() or not lo<=v<=hi: raise Invalid('Invalid '+k)
         if k=='pps' and v%10: raise Invalid('PPS must be in increments of ten')
         if k=='adl_dependence' and v%1: raise Invalid('ADL count must be an integer')
         out[k]=Decimal(str(v))
@@ -42,6 +42,12 @@ def metrics(value):
         if value[k] not in allowed: raise Invalid('Invalid '+k)
         out[k]=value[k]
     return out
+
+def history_order(row):
+    return (row['assessment_date'],row.get('finalized_at',row['created_at']),row['visit_id'])
+
+def history_fingerprint(rows):
+    return hashlib.sha256(json.dumps(sorted((x['visit_id'],x['version']) for x in rows)).encode()).hexdigest()
 
 def compare(current, previous):
     result={}
@@ -98,17 +104,25 @@ class Store:
         profile=self.get(profile_key)
         if action=='set_patient_status':
             status=body.get('status')
-            if status not in ('active','inactive'): raise Invalid('Invalid patient status')
+            if status not in ('active','inactive','discharged','deceased'): raise Invalid('Invalid patient status')
             row=self.table.update_item(Key=self.key(profile_key),UpdateExpression='SET #s=:s, updated_at=:at, updated_by=:by',
                 ConditionExpression='attribute_exists(PK)',ExpressionAttributeNames={'#s':'status'},
                 ExpressionAttributeValues={':s':status,':at':now(),':by':self.sub},ReturnValues='ALL_NEW')
             return {'patient':row['Attributes']}
         prefix='VISIT#'+pid+'#'
+        if action=='add_addendum':
+            target=clean_id(body.get('visit_id'))
+            visit=self.get(prefix+target)
+            if visit['status']!='final': raise Conflict('Only finalized records accept addenda')
+            note=body.get('note')
+            if not isinstance(note,str) or not note.strip() or len(note)>4000: raise Invalid('Addendum text required')
+            aid=clean_id(body.get('addendum_id'))
+            return {'addendum':self.put('ADDENDUM#'+pid+'#'+target+'#'+aid,{'patient_id':pid,'visit_id':target,'note':note,'created_at':now(),'created_by':self.sub})}
         if action=='get_chart':
             rows=list(self.query(prefix))
-            final=sorted((x for x in rows if x['status']=='final'),key=lambda x:(x['assessment_date'],x['created_at']))
+            final=sorted((x for x in rows if x['status']=='final'),key=history_order)
             baseline=next((x for x in final if x['visit_type']=='Admission'),None)
-            return {'patient':profile,'visits':rows,'baseline':baseline}
+            return {'patient':profile,'visits':rows,'baseline':baseline,'addenda':list(self.query('ADDENDUM#'+pid+'#')),'benefit_periods':sorted(set(x['benefit_period'] for x in final))}
         if action not in ('save_draft','review_visit','finalize_visit'): raise Invalid('Unknown action')
         vid=clean_id(body.get('visit_id'))
         sk=prefix+vid
@@ -118,7 +132,7 @@ class Store:
         if previous and (previous['status']!='draft' or previous['version']!=version): raise Conflict('Draft changed or finalized')
         data=bounded(body.get('assessment'))
         visit_type=data.get('visit_type')
-        if visit_type not in ('Admission','Routine nursing visit','PRN visit','Recertification'): raise Invalid('Invalid visit type')
+        if visit_type not in ('Admission','Routine nursing visit','PRN visit','Recertification','Discharge','IDG','Face-to-face','CTI evidence summary'): raise Invalid('Invalid visit type')
         try: day=date.fromisoformat(data['assessment_date']).isoformat()
         except (KeyError,ValueError,TypeError): raise Invalid('Invalid assessment date')
         if day>datetime.now(timezone.utc).date().isoformat(): raise Invalid('Future assessment date')
@@ -133,6 +147,9 @@ class Store:
             if weight_date!=day: raise Invalid('Current structured weight must be measured on assessment date')
         row={'patient_id':pid,'visit_id':vid,'version':version+1,'status':'draft','assessment_date':day,'visit_type':visit_type,'benefit_period':bp,'assessment':findings,'metrics':current,'form':bounded(data.get('form',{})),'created_at':previous['created_at'] if previous else now(),'created_by':self.sub}
         if action=='finalize_visit':
+            history=list(x for x in self.query(prefix) if x['status']=='final')
+            if previous and previous.get('history_fingerprint')!=history_fingerprint(history):
+                raise Conflict('Chart history changed; review again')
             if not previous or previous.get('review',{}).get('status')!='draft_ready':
                 raise Conflict('Review this draft before finalizing')
             for k in ('assessment_date','visit_type','benefit_period','assessment','metrics','form'):
@@ -142,8 +159,12 @@ class Store:
                        prior_visit_id=previous['prior_visit_id'],baseline_visit_id=previous['baseline_visit_id'])
         if action=='review_visit':
             if not findings.strip(): raise Invalid('Assessment findings required')
-            history=sorted((x for x in self.query(prefix) if x['status']=='final' and x['assessment_date']<=day),key=lambda x:(x['assessment_date'],x['created_at']))
-            prior=history[-1] if history else None
+            all_history=[x for x in self.query(prefix) if x['status']=='final']
+            row['history_fingerprint']=history_fingerprint(all_history)
+            history=sorted((x for x in all_history if x['assessment_date']<=day),key=history_order)
+            clinical_history=[x for x in history if x['visit_type'] not in ('IDG','CTI evidence summary')]
+            candidates=([x for x in history if x['visit_type']=='IDG'] if visit_type=='IDG' else [x for x in clinical_history if x['benefit_period']<bp] if visit_type=='Recertification' else clinical_history)
+            prior=candidates[-1] if candidates else None
             baseline=next((x for x in history if x['visit_type']=='Admission'),None)
             row['comparison']=compare(current,prior['metrics']) if prior else {}
             row['baseline_comparison']=compare(current,baseline['metrics']) if baseline else {}
@@ -151,10 +172,13 @@ class Store:
             row['baseline_visit_id']=baseline['visit_id'] if baseline else None
             patient={**profile['profile'],'patient_id':pid,'visit_type':visit_type,'benefit_period':bp,'assessment':findings}
             patient.pop('name',None)
+            patient['current_structured_findings']=safe_json(current)
             if 'pps' in current: patient['current_pps']=int(current['pps'])
             if prior and 'pps' in prior['metrics']: patient['previous_pps']=int(prior['metrics']['pps'])
             if row['comparison']: patient['verified_prior_comparison']={'assessment_date':prior['assessment_date'],'metrics':safe_json(row['comparison'])}
             if row['baseline_comparison']: patient['verified_admission_comparison']={'assessment_date':baseline['assessment_date'],'metrics':safe_json(row['baseline_comparison'])}
+            if visit_type in ('IDG','CTI evidence summary','Face-to-face','Recertification'):
+                patient['dated_prior_findings']=[{'date':x['assessment_date'],'type':x['visit_type'],'benefit_period':x['benefit_period'],'metrics':safe_json(x['metrics']),'assessment':x['assessment'][:1500]} for x in history[-8:]]
             output=review(safe_json(patient))
             if output.get('status')!='draft_ready': return {'review':output}
             row['review']=bounded(output,60000)
